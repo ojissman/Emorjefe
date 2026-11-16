@@ -1,126 +1,148 @@
-name: RDP
+
+name: RDP Nigeria
 
 on:
   workflow_dispatch:
 
+permissions:
+  contents: read
+  id-token: write
+
 jobs:
   secure-rdp:
     runs-on: windows-latest
-    timeout-minutes: 3600
+    timeout-minutes: 360
 
     steps:
-      - name: Configure Core RDP Settings
-        shell: powershell
+      # 1. Configure Windows RDP securely
+      - name: Configure RDP Security
+        shell: pwsh
         run: |
-          # Enable Remote Desktop and disable Network Level Authentication (if needed)
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
-                             -Name "fDenyTSConnections" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-                             -Name "UserAuthentication" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-                             -Name "SecurityLayer" -Value 0 -Force
+          Set-ItemProperty `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+            -Name "fDenyTSConnections" -Value 0
 
-          # Remove any existing rule with the same name
-          netsh advfirewall firewall delete rule name="RDP-Tailscale"
+          # Enable Network Level Authentication
+          Set-ItemProperty `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name "UserAuthentication" -Value 1
 
-          # Allow RDP
-          netsh advfirewall firewall add rule name="RDP-Tailscale" `
-            dir=in action=allow protocol=TCP localport=3389
+          # Require TLS security
+          Set-ItemProperty `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name "SecurityLayer" -Value 2
 
-          # Restart Remote Desktop service
-          Restart-Service -Name TermService -Force
+          # Disable broad default RDP firewall rules
+          Get-NetFirewallRule -DisplayGroup "Remote Desktop" |
+            Disable-NetFirewallRule
 
-      - name: Create RDP User with Fixed Password
-        shell: powershell
+          # Permit RDP only from Tailscale addresses
+          New-NetFirewallRule `
+            -DisplayName "RDP-Tailscale-Only" `
+            -Direction Inbound `
+            -Protocol TCP `
+            -LocalPort 3389 `
+            -RemoteAddress "100.64.0.0/10" `
+            -Action Allow `
+            -Profile Any
+
+          Restart-Service TermService -Force
+
+      # 2. Create RDP administrator account
+      - name: Create RDP User
+        shell: pwsh
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
         run: |
-          $password = "${{ secrets.RDP_PASSWORD }}"
-          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+          if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD)) {
+            throw "RDP_PASSWORD secret is missing."
+          }
 
-          # Remove existing RDP user if present
+          $securePass = ConvertTo-SecureString `
+            $env:RDP_PASSWORD -AsPlainText -Force
+
           if (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue) {
-              Remove-LocalUser -Name "RDP"
+            Remove-LocalUser -Name "RDP"
           }
 
-          # Create user
-          New-LocalUser -Name "RDP" `
-                        -Password $securePass `
-                        -AccountNeverExpires
+          New-LocalUser `
+            -Name "RDP" `
+            -Password $securePass `
+            -AccountNeverExpires `
+            -PasswordNeverExpires
 
-          Add-LocalGroupMember -Group "Administrators" -Member "RDP"
-          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
+          Add-LocalGroupMember `
+            -Group "Administrators" -Member "RDP"
 
-          echo "RDP_CREDS=User: RDP | Password: $password" >> $env:GITHUB_ENV
+          Add-LocalGroupMember `
+            -Group "Remote Desktop Users" -Member "RDP"
 
-          if (-not (Get-LocalUser -Name "RDP")) {
-              Write-Error "User creation failed"
-              exit 1
-          }
+          Write-Host "RDP account created successfully."
 
-      - name: Install Tailscale
-        shell: powershell
+      # 3. Connect GitHub runner to Tailscale
+      - name: Connect to Tailscale Nigeria
+        uses: tailscale/github-action@v4
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          audience: ${{ secrets.TS_AUDIENCE }}
+          tags: tag:ci
+          version: latest
+          args: --exit-node=100.120.205.77 --accept-dns=true
+          ping: 100.120.205.77
+
+      # 4. Get runner Tailscale IP
+      - name: Get Tailscale IP
+        shell: pwsh
         run: |
-          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
-          $installerPath = "$env:TEMP\tailscale.msi"
-
-          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
-
-          Start-Process msiexec.exe `
-            -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" `
-            -Wait
-
-          Remove-Item $installerPath -Force
-
-      - name: Establish Tailscale Connection
-        shell: powershell
-        run: |
-          & "$env:ProgramFiles\Tailscale\tailscale.exe" up `
-            --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} `
-            --hostname=gh-runner-$env:GITHUB_RUN_ID
-
-          $tsIP = $null
-          $retries = 0
-
-          while (-not $tsIP -and $retries -lt 10) {
-              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
-              Start-Sleep -Seconds 5
-              $retries++
-          }
+          $tsIP = (tailscale ip -4 | Select-Object -First 1).Trim()
 
           if (-not $tsIP) {
-              Write-Error "Tailscale IP not assigned."
-              exit 1
+            throw "Tailscale IP was not assigned."
           }
 
-          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+          Add-Content $env:GITHUB_ENV "TAILSCALE_IP=$tsIP"
 
-      - name: Verify RDP Accessibility
-        shell: powershell
+          Write-Host "RDP Tailscale IP: $tsIP"
+
+      # 5. Verify outgoing Nigerian public IP
+      - name: Verify Nigerian Internet Connection
+        shell: pwsh
         run: |
-          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+          Start-Sleep -Seconds 5
 
-          $testResult = Test-NetConnection `
-              -ComputerName $env:TAILSCALE_IP `
-              -Port 3389
+          $ip = (Invoke-RestMethod `
+            -Uri "https://api.ipify.org").Trim()
 
-          if (-not $testResult.TcpTestSucceeded) {
-              Write-Error "TCP connection to port 3389 failed."
-              exit 1
+          Write-Host "Public IP: $ip"
+
+          $geo = Invoke-RestMethod `
+            -Uri "https://ipapi.co/$ip/json/"
+
+          Write-Host "Country: $($geo.country_name)"
+          Write-Host "Country Code: $($geo.country_code)"
+          Write-Host "City: $($geo.city)"
+
+          if ($geo.country_code -ne "NG") {
+            Write-Warning "IP geolocation does not report Nigeria. Check exit-node routing and ISP geolocation."
           }
 
-          Write-Host "TCP connectivity successful!"
-
-      - name: Maintain Connection
-        shell: powershell
+      # 6. Display RDP connection information
+      - name: Display RDP Access
+        shell: pwsh
         run: |
           Write-Host ""
-          Write-Host "=========== RDP ACCESS ==========="
+          Write-Host "========== RDP ACCESS =========="
           Write-Host "Address : $env:TAILSCALE_IP"
           Write-Host "Username: RDP"
-          Write-Host "Password: $env:RDP_CREDS"
-          Write-Host "=================================="
-          Write-Host ""
+          Write-Host "Password: Use your existing RDP_PASSWORD secret"
+          Write-Host "Exit Node: 100.120.205.77"
+          Write-Host "================================"
 
+      # 7. Keep the RDP session alive
+      - name: Maintain RDP Session
+        shell: pwsh
+        run: |
           while ($true) {
-              Write-Host "[$(Get-Date)] RDP Active..."
-              Start-Sleep -Seconds 300
+            Write-Host "[$(Get-Date)] RDP session active..."
+            Start-Sleep -Seconds 300
           }
