@@ -1,0 +1,148 @@
+
+name: RDP Nigeria
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  secure-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 360
+
+    steps:
+      # 1. Configure Windows RDP securely
+      - name: Configure RDP Security
+        shell: pwsh
+        run: |
+          Set-ItemProperty `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+            -Name "fDenyTSConnections" -Value 0
+
+          # Enable Network Level Authentication
+          Set-ItemProperty `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name "UserAuthentication" -Value 1
+
+          # Require TLS security
+          Set-ItemProperty `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name "SecurityLayer" -Value 2
+
+          # Disable broad default RDP firewall rules
+          Get-NetFirewallRule -DisplayGroup "Remote Desktop" |
+            Disable-NetFirewallRule
+
+          # Permit RDP only from Tailscale addresses
+          New-NetFirewallRule `
+            -DisplayName "RDP-Tailscale-Only" `
+            -Direction Inbound `
+            -Protocol TCP `
+            -LocalPort 3389 `
+            -RemoteAddress "100.64.0.0/10" `
+            -Action Allow `
+            -Profile Any
+
+          Restart-Service TermService -Force
+
+      # 2. Create RDP administrator account
+      - name: Create RDP User
+        shell: pwsh
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD)) {
+            throw "RDP_PASSWORD secret is missing."
+          }
+
+          $securePass = ConvertTo-SecureString `
+            $env:RDP_PASSWORD -AsPlainText -Force
+
+          if (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue) {
+            Remove-LocalUser -Name "RDP"
+          }
+
+          New-LocalUser `
+            -Name "RDP" `
+            -Password $securePass `
+            -AccountNeverExpires `
+            -PasswordNeverExpires
+
+          Add-LocalGroupMember `
+            -Group "Administrators" -Member "RDP"
+
+          Add-LocalGroupMember `
+            -Group "Remote Desktop Users" -Member "RDP"
+
+          Write-Host "RDP account created successfully."
+
+      # 3. Connect GitHub runner to Tailscale
+      - name: Connect to Tailscale Nigeria
+        uses: tailscale/github-action@v4
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          audience: ${{ secrets.TS_AUDIENCE }}
+          tags: tag:ci
+          version: latest
+          args: --exit-node=100.120.205.77 --accept-dns=true
+          ping: 100.120.205.77
+
+      # 4. Get runner Tailscale IP
+      - name: Get Tailscale IP
+        shell: pwsh
+        run: |
+          $tsIP = (tailscale ip -4 | Select-Object -First 1).Trim()
+
+          if (-not $tsIP) {
+            throw "Tailscale IP was not assigned."
+          }
+
+          Add-Content $env:GITHUB_ENV "TAILSCALE_IP=$tsIP"
+
+          Write-Host "RDP Tailscale IP: $tsIP"
+
+      # 5. Verify outgoing Nigerian public IP
+      - name: Verify Nigerian Internet Connection
+        shell: pwsh
+        run: |
+          Start-Sleep -Seconds 5
+
+          $ip = (Invoke-RestMethod `
+            -Uri "https://api.ipify.org").Trim()
+
+          Write-Host "Public IP: $ip"
+
+          $geo = Invoke-RestMethod `
+            -Uri "https://ipapi.co/$ip/json/"
+
+          Write-Host "Country: $($geo.country_name)"
+          Write-Host "Country Code: $($geo.country_code)"
+          Write-Host "City: $($geo.city)"
+
+          if ($geo.country_code -ne "NG") {
+            Write-Warning "IP geolocation does not report Nigeria. Check exit-node routing and ISP geolocation."
+          }
+
+      # 6. Display RDP connection information
+      - name: Display RDP Access
+        shell: pwsh
+        run: |
+          Write-Host ""
+          Write-Host "========== RDP ACCESS =========="
+          Write-Host "Address : $env:TAILSCALE_IP"
+          Write-Host "Username: RDP"
+          Write-Host "Password: Use your existing RDP_PASSWORD secret"
+          Write-Host "Exit Node: 100.120.205.77"
+          Write-Host "================================"
+
+      # 7. Keep the RDP session alive
+      - name: Maintain RDP Session
+        shell: pwsh
+        run: |
+          while ($true) {
+            Write-Host "[$(Get-Date)] RDP session active..."
+            Start-Sleep -Seconds 300
+          }
