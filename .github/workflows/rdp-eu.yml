@@ -1,5 +1,6 @@
 
-name: RDP Europe
+name: Proton VPN - WireGuard Diagnostics
+
 on:
   workflow_dispatch:
 
@@ -7,19 +8,18 @@ permissions:
   contents: read
 
 jobs:
-  vpn-test:
+  diagnose:
     runs-on: windows-latest
-    timeout-minutes: 15
+    timeout-minutes: 10
 
     steps:
-      # 1. Check Proton configuration
-      - name: Check Proton Configuration
+      - name: Validate Proton configuration
         shell: pwsh
         env:
           PROTON_WG_CONFIG: ${{ secrets.PROTON_WG_CONFIG }}
         run: |
           if ([string]::IsNullOrWhiteSpace($env:PROTON_WG_CONFIG)) {
-            throw "PROTON_WG_CONFIG secret is missing."
+            throw "Missing Proton configuration."
           }
 
           if ($env:PROTON_WG_CONFIG -notmatch '\[Interface\]' -or
@@ -27,22 +27,27 @@ jobs:
             throw "Invalid WireGuard configuration."
           }
 
-          Write-Host "Proton configuration detected successfully."
+          Write-Host "Configuration sections detected."
 
-      # 2. Install WireGuard
+          if ($env:PROTON_WG_CONFIG -match '(?im)^PrivateKey\s*=') {
+            Write-Host "Private key field detected."
+          } else {
+            throw "Private key field missing."
+          }
+
       - name: Install WireGuard
         shell: pwsh
         run: |
           $msi = Join-Path $env:TEMP "wireguard-amd64.msi"
 
-          $url = "https://download.wireguard.com/windows-client/wireguard-amd64-1.1.1.msi"
-
-          Invoke-WebRequest -Uri $url -OutFile $msi
+          Invoke-WebRequest `
+            -Uri "https://download.wireguard.com/windows-client/wireguard-amd64-1.1.1.msi" `
+            -OutFile $msi
 
           $signature = Get-AuthenticodeSignature $msi
 
           if ($signature.Status -ne "Valid") {
-            throw "WireGuard installer signature is invalid."
+            throw "Invalid installer signature."
           }
 
           $result = Start-Process msiexec.exe `
@@ -50,134 +55,72 @@ jobs:
             -Wait -PassThru
 
           if ($result.ExitCode -notin @(0, 3010)) {
-            throw "WireGuard installation failed."
+            throw "Installation failed: $($result.ExitCode)"
           }
 
-          $wg = "$env:ProgramFiles\WireGuard\wireguard.exe"
+          Write-Host "WireGuard installed."
 
-          if (-not (Test-Path $wg)) {
-            throw "WireGuard executable not found."
-          }
-
-          Write-Host "WireGuard installed successfully."
-
-      # 3. Connect automatically to Proton VPN
-      - name: Connect Proton VPN Netherlands
+      - name: Diagnose tunnel installation
         shell: pwsh
         env:
           PROTON_WG_CONFIG: ${{ secrets.PROTON_WG_CONFIG }}
         run: |
+          $wg = "$env:ProgramFiles\WireGuard\wireguard.exe"
           $configPath = Join-Path $env:RUNNER_TEMP "proton-eu.conf"
 
-          $config = $env:PROTON_WG_CONFIG.Trim()
-
           Set-Content -Path $configPath `
-            -Value $config -Encoding ascii
+            -Value $env:PROTON_WG_CONFIG.Trim() `
+            -Encoding ascii
 
-          $wg = "$env:ProgramFiles\WireGuard\wireguard.exe"
+          Write-Host "WireGuard executable:"
+          Write-Host $wg
 
-          Write-Host "Installing Proton VPN tunnel service..."
+          Write-Host "Checking configuration format..."
 
-          & $wg /installtunnelservice $configPath
+          $lines = Get-Content $configPath
 
-          if ($LASTEXITCODE -ne 0) {
-            Remove-Item $configPath -Force -ErrorAction SilentlyContinue
-            throw "Could not install Proton VPN tunnel service."
+          Write-Host "Configuration line count: $($lines.Count)"
+          Write-Host "Interface section: $([bool]($lines -match '^\[Interface\]'))"
+          Write-Host "Peer section: $([bool]($lines -match '^\[Peer\]'))"
+
+          Write-Host "Attempting tunnel service installation..."
+
+          & $wg /installtunnelservice $configPath 2>&1 |
+            ForEach-Object { Write-Host $_ }
+
+          $exitCode = $LASTEXITCODE
+
+          Write-Host "WireGuard exit code: $exitCode"
+
+          Write-Host "Checking tunnel services..."
+
+          Get-Service -Name "WireGuardTunnel*" `
+            -ErrorAction SilentlyContinue |
+            Format-Table Name, Status
+
+          Write-Host "Checking WireGuard service..."
+
+          Get-Service -Name "WireGuardManager" `
+            -ErrorAction SilentlyContinue |
+            Format-Table Name, Status
+
+          Write-Host "Checking recent service events..."
+
+          Get-WinEvent -FilterHashtable @{
+            LogName = "System"
+            StartTime = (Get-Date).AddMinutes(-5)
+          } -ErrorAction SilentlyContinue |
+            Where-Object {
+              $_.ProviderName -match "Service Control Manager"
+            } |
+            Select-Object -First 10 TimeCreated, Id, Message |
+            Format-List
+
+          Remove-Item $configPath -Force `
+            -ErrorAction SilentlyContinue
+
+          if ($exitCode -ne 0) {
+            Write-Warning "Tunnel installation failed. Diagnostic information collected."
+          } else {
+            Write-Host "Tunnel installation succeeded."
           }
-
-          $serviceName = 'WireGuardTunnel$proton-eu'
-
-          $service = Get-Service -Name $serviceName `
-            -ErrorAction Stop
-
-          if ($service.Status -ne "Running") {
-            Start-Service -Name $serviceName
-          }
-
-          Write-Host "Waiting for Proton VPN connection..."
-
-          $wgExe = "$env:ProgramFiles\WireGuard\wg.exe"
-
-          $deadline = (Get-Date).AddSeconds(120)
-          $connected = $false
-
-          do {
-            Start-Sleep -Seconds 3
-
-            try {
-              $ip = (Invoke-RestMethod `
-                -Uri "https://api.ipify.org" `
-                -TimeoutSec 10).Trim()
-            }
-            catch {
-              Write-Host "Waiting for internet through VPN..."
-            }
-
-            $handshakes = & $wgExe show proton-eu latest-handshakes
-
-            foreach ($line in $handshakes) {
-              $parts = $line -split '\s+'
-
-              if ($parts.Count -ge 2) {
-                $timestamp = 0L
-
-                if ([long]::TryParse($parts[-1], [ref]$timestamp)) {
-                  $age = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds() - $timestamp
-
-                  if ($timestamp -gt 0 -and $age -lt 120) {
-                    $connected = $true
-                  }
-                }
-              }
-            }
-
-          } until ($connected -or (Get-Date) -gt $deadline)
-
-          if (-not $connected) {
-            throw "Proton VPN handshake was not established."
-          }
-
-          Write-Host "Proton VPN handshake successful."
-
-      # 4. Verify public IP and country
-      - name: Verify Netherlands Public IP
-        shell: pwsh
-        run: |
-          Start-Sleep -Seconds 5
-
-          $ip = (Invoke-RestMethod `
-            -Uri "https://api.ipify.org" `
-            -TimeoutSec 20).Trim()
-
-          Write-Host "Public IP: $ip"
-
-          $geo = Invoke-RestMethod `
-            -Uri "https://ipapi.co/$ip/json/" `
-            -TimeoutSec 20
-
-          Write-Host "Country: $($geo.country_name)"
-          Write-Host "Country code: $($geo.country_code)"
-          Write-Host "City: $($geo.city)"
-
-          if ($geo.country_code -ne "NL") {
-            throw "Expected Netherlands IP, received $($geo.country_code)."
-          }
-
-          Write-Host "Netherlands VPN verification successful!"
-
-      # 5. Disconnect test tunnel and clean up
-      - name: Disconnect Proton VPN
-        if: always()
-        shell: pwsh
-        run: |
-          $wg = "$env:ProgramFiles\WireGuard\wireguard.exe"
-
-          if (Test-Path $wg) {
-            & $wg /uninstalltunnelservice proton-eu
-          }
-
-          Remove-Item `
-            (Join-Path $env:RUNNER_TEMP "proton-eu.conf") `
-            -Force -ErrorAction SilentlyContinue
-
-          Write-Host "VPN test cleanup completed."
