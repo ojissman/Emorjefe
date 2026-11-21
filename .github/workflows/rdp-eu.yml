@@ -14,7 +14,7 @@ jobs:
     timeout-minutes: 15
 
     steps:
-      - name: Check required secret
+      - name: Check Proton configuration
         shell: pwsh
         env:
           PROTON_WG_CONFIG: ${{ secrets.PROTON_WG_CONFIG }}
@@ -28,55 +28,63 @@ jobs:
             throw "Invalid WireGuard configuration."
           }
 
-          Write-Host "VPN configuration secret detected."
+          Write-Host "Proton configuration detected successfully."
 
-      - name: Install WireGuard
+      - name: Download official WireGuard installer
         shell: pwsh
         run: |
-          $release = Invoke-RestMethod `
-            -Uri "https://api.github.com/repos/WireGuard/wireguard-windows/releases/latest" `
-            -Headers @{ "User-Agent" = "GitHub-Actions" }
+          $msi = Join-Path $env:TEMP "wireguard-amd64.msi"
 
-          $asset = $release.assets |
-            Where-Object {
-              $_.name -match '^wireguard-amd64-.*\.msi$'
-            } |
-            Select-Object -First 1
+          $url = "https://download.wireguard.com/windows-client/wireguard-amd64-1.1.1.msi"
 
-          if (-not $asset) {
-            throw "WireGuard installer not found."
+          Write-Host "Downloading WireGuard..."
+
+          Invoke-WebRequest -Uri $url -OutFile $msi
+
+          if (-not (Test-Path $msi)) {
+            throw "WireGuard installer download failed."
           }
-
-          $msi = Join-Path $env:TEMP "wireguard.msi"
-
-          Invoke-WebRequest `
-            -Uri $asset.browser_download_url `
-            -OutFile $msi
 
           $signature = Get-AuthenticodeSignature $msi
 
           if ($signature.Status -ne "Valid") {
-            throw "WireGuard installer signature invalid."
+            throw "WireGuard installer signature is invalid."
           }
+
+          Write-Host "Installer signature verified."
 
           $result = Start-Process msiexec.exe `
             -ArgumentList "/i `"$msi`" /qn /norestart" `
             -Wait -PassThru
 
           if ($result.ExitCode -notin @(0, 3010)) {
-            throw "WireGuard installation failed."
+            throw "WireGuard installation failed. Exit code: $($result.ExitCode)"
+          }
+
+          $wg = "$env:ProgramFiles\WireGuard\wireguard.exe"
+
+          if (-not (Test-Path $wg)) {
+            throw "WireGuard executable was not found."
           }
 
           Write-Host "WireGuard installed successfully."
 
-      - name: Verify installation
+      - name: Verify WireGuard installation
         shell: pwsh
         run: |
           $wg = "$env:ProgramFiles\WireGuard\wireguard.exe"
+          $wgExe = "$env:ProgramFiles\WireGuard\wg.exe"
 
           if (-not (Test-Path $wg)) {
-            throw "WireGuard executable not found."
+            throw "WireGuard application not found."
           }
 
-          Write-Host "WireGuard executable verified."
-          Write-Host "VPN installation test passed."
+          if (-not (Test-Path $wgExe)) {
+            throw "WireGuard command-line utility not found."
+          }
+
+          $version = (Get-Item $wg).VersionInfo.FileVersion
+
+          Write-Host "WireGuard version: $version"
+          Write-Host "WireGuard installation verified."
+          Write-Host "VPN installation test PASSED."
