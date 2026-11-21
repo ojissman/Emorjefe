@@ -1,0 +1,330 @@
+
+name: RDP Europe - Proton VPN
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  secure-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 360
+
+    steps:
+
+      # 1. Configure RDP security
+      - name: Configure RDP Security
+        shell: pwsh
+        run: |
+          Set-ItemProperty `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+            -Name "fDenyTSConnections" -Value 0
+
+          Set-ItemProperty `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name "UserAuthentication" -Value 1
+
+          Set-ItemProperty `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name "SecurityLayer" -Value 2
+
+          Get-NetFirewallRule -DisplayGroup "Remote Desktop" |
+            Disable-NetFirewallRule
+
+          Get-NetFirewallRule -DisplayName "RDP-Tailscale-Only" `
+            -ErrorAction SilentlyContinue |
+            Remove-NetFirewallRule
+
+          New-NetFirewallRule `
+            -DisplayName "RDP-Tailscale-Only" `
+            -Direction Inbound `
+            -Protocol TCP `
+            -LocalPort 3389 `
+            -RemoteAddress "100.64.0.0/10" `
+            -Action Allow `
+            -Profile Any
+
+          Restart-Service TermService -Force
+
+      # 2. Create RDP administrator
+      - name: Create RDP User
+        shell: pwsh
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD)) {
+            throw "RDP_PASSWORD secret is missing."
+          }
+
+          $securePass = ConvertTo-SecureString `
+            $env:RDP_PASSWORD -AsPlainText -Force
+
+          if (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue) {
+            Remove-LocalUser -Name "RDP"
+          }
+
+          New-LocalUser `
+            -Name "RDP" `
+            -Password $securePass `
+            -AccountNeverExpires `
+            -PasswordNeverExpires
+
+          Add-LocalGroupMember `
+            -Group "Administrators" -Member "RDP"
+
+          Add-LocalGroupMember `
+            -Group "Remote Desktop Users" -Member "RDP"
+
+      # 3. Connect Tailscale
+      # No Nigerian exit node: Tailscale is for RDP access.
+      - name: Connect Tailscale
+        uses: tailscale/github-action@v4
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          audience: ${{ secrets.TS_AUDIENCE }}
+          tags: tag:ci
+          version: latest
+          args: --accept-dns=false
+
+      # 4. Get Tailscale IP
+      - name: Get Tailscale IP
+        shell: pwsh
+        run: |
+          $tsIP = (tailscale ip -4 |
+            Select-Object -First 1).Trim()
+
+          if (-not $tsIP) {
+            throw "Tailscale IP was not assigned."
+          }
+
+          Add-Content $env:GITHUB_ENV "TAILSCALE_IP=$tsIP"
+
+          Write-Host "RDP Tailscale IP: $tsIP"
+
+      # 5. Install official WireGuard client
+      - name: Install WireGuard
+        shell: pwsh
+        run: |
+          $release = Invoke-RestMethod `
+            -Uri "https://api.github.com/repos/WireGuard/wireguard-windows/releases/latest" `
+            -Headers @{ "User-Agent" = "GitHub-Actions" }
+
+          $asset = $release.assets |
+            Where-Object {
+              $_.name -match '^wireguard-amd64-.*\.msi$'
+            } |
+            Select-Object -First 1
+
+          if (-not $asset) {
+            throw "WireGuard MSI was not found."
+          }
+
+          $msi = Join-Path $env:TEMP "wireguard.msi"
+
+          Invoke-WebRequest `
+            -Uri $asset.browser_download_url `
+            -OutFile $msi
+
+          $signature = Get-AuthenticodeSignature $msi
+
+          if ($signature.Status -ne "Valid") {
+            throw "WireGuard installer signature is invalid."
+          }
+
+          $install = Start-Process msiexec.exe `
+            -ArgumentList "/i `"$msi`" /qn /norestart" `
+            -Wait -PassThru
+
+          if ($install.ExitCode -notin @(0, 3010)) {
+            throw "WireGuard installation failed."
+          }
+
+          if (-not (Test-Path "$env:ProgramFiles\WireGuard\wireguard.exe")) {
+            throw "WireGuard executable not found."
+          }
+
+          Write-Host "WireGuard installed."
+
+      # 6. Install and connect Proton WireGuard tunnel
+      - name: Connect Proton VPN Europe
+        shell: pwsh
+        env:
+          PROTON_WG_CONFIG: ${{ secrets.PROTON_WG_CONFIG }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:PROTON_WG_CONFIG)) {
+            throw "PROTON_WG_CONFIG secret is missing."
+          }
+
+          $config = $env:PROTON_WG_CONFIG.Trim()
+
+          if ($config -notmatch '\[Interface\]' -or
+              $config -notmatch '\[Peer\]') {
+            throw "Invalid WireGuard configuration."
+          }
+
+          # Split default routes into two /1 routes.
+          # This preserves the more-specific Tailscale
+          # 100.64.0.0/10 route for incoming RDP.
+
+          $config = [regex]::Replace(
+            $config,
+            '(?m)^AllowedIPs\s*=\s*(.+)$',
+            {
+              param($match)
+
+              $items = $match.Groups[1].Value -split '\s*,\s*'
+              $expanded = [System.Collections.Generic.List[string]]::new()
+
+              foreach ($item in $items) {
+                switch -Exact ($item) {
+                  '0.0.0.0/0' {
+                    $expanded.Add('0.0.0.0/1')
+                    $expanded.Add('128.0.0.0/1')
+                    break
+                  }
+                  '::/0' {
+                    $expanded.Add('::/1')
+                    $expanded.Add('8000::/1')
+                    break
+                  }
+                  default {
+                    $expanded.Add($item)
+                  }
+                }
+              }
+
+              'AllowedIPs = ' + ($expanded -join ', ')
+            }
+          )
+
+          if ($config -notmatch '0\.0\.0\.0/1' -or
+              $config -notmatch '128\.0\.0\.0/1') {
+            throw "VPN configuration does not contain a full IPv4 tunnel."
+          }
+
+          $folder = "C:\ProgramData\WireGuard"
+          New-Item -ItemType Directory -Force -Path $folder | Out-Null
+
+          icacls $folder /inheritance:r `
+            /grant:r '*S-1-5-32-544:(OI)(CI)F' `
+            '*S-1-5-18:(OI)(CI)F' | Out-Null
+
+          $configPath = Join-Path $folder "proton-eu.conf"
+
+          Set-Content -Path $configPath `
+            -Value $config -Encoding ascii
+
+          $wg = "$env:ProgramFiles\WireGuard\wireguard.exe"
+
+          & $wg /installtunnelservice $configPath
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Could not install WireGuard tunnel service."
+          }
+
+          $serviceName = 'WireGuardTunnel$proton-eu'
+
+          $service = Get-Service -Name $serviceName `
+            -ErrorAction Stop
+
+          if ($service.Status -ne "Running") {
+            Start-Service -Name $serviceName
+          }
+
+          Write-Host "Waiting for VPN handshake..."
+
+          $wgExe = "$env:ProgramFiles\WireGuard\wg.exe"
+          $deadline = (Get-Date).AddSeconds(90)
+          $connected = $false
+
+          do {
+            Start-Sleep -Seconds 3
+
+            $handshakes = & $wgExe show proton-eu latest-handshakes
+
+            foreach ($line in $handshakes) {
+              $parts = $line -split '\s+'
+
+              if ($parts.Count -ge 2) {
+                $timestamp = 0L
+
+                if ([long]::TryParse($parts[-1], [ref]$timestamp)) {
+                  if ($timestamp -gt 0 -and
+                      ([DateTimeOffset]::UtcNow.ToUnixTimeSeconds() - $timestamp) -lt 120) {
+                    $connected = $true
+                  }
+                }
+              }
+            }
+
+          } until ($connected -or (Get-Date) -gt $deadline)
+
+          if (-not $connected) {
+            throw "Proton VPN handshake failed."
+          }
+
+          Write-Host "Proton VPN tunnel connected."
+
+      # 7. Verify European public IP
+      - name: Verify European IP
+        shell: pwsh
+        run: |
+          $ip = (Invoke-RestMethod `
+            -Uri "https://api.ipify.org").Trim()
+
+          $geo = Invoke-RestMethod `
+            -Uri "https://ipapi.co/$ip/json/"
+
+          Write-Host "Public IP: $ip"
+          Write-Host "Country: $($geo.country_name)"
+          Write-Host "Country code: $($geo.country_code)"
+
+          $allowedCountries = @("NL", "PL", "RO")
+
+          if ($geo.country_code -notin $allowedCountries) {
+            throw "VPN IP is not in an approved EU country."
+          }
+
+          Write-Host "European VPN IP verified."
+
+      # 8. Display RDP information
+      - name: Display RDP Access
+        shell: pwsh
+        run: |
+          Write-Host ""
+          Write-Host "========== RDP ACCESS =========="
+          Write-Host "Address : $env:TAILSCALE_IP"
+          Write-Host "Username: RDP"
+          Write-Host "Password: Use RDP_PASSWORD secret"
+          Write-Host "VPN     : Proton VPN Europe"
+          Write-Host "================================"
+
+      # 9. Maintain session and periodically verify VPN
+      - name: Maintain RDP Session
+        shell: pwsh
+        run: |
+          while ($true) {
+            Start-Sleep -Seconds 300
+
+            $service = Get-Service `
+              -Name 'WireGuardTunnel$proton-eu'
+
+            if ($service.Status -ne "Running") {
+              throw "VPN service stopped."
+            }
+
+            $ip = (Invoke-RestMethod `
+              -Uri "https://api.ipify.org").Trim()
+
+            $geo = Invoke-RestMethod `
+              -Uri "https://ipapi.co/$ip/json/"
+
+            Write-Host "[$(Get-Date)] IP: $ip | Country: $($geo.country_code)"
+
+            if ($geo.country_code -notin @("NL", "PL", "RO")) {
+              throw "VPN country verification failed."
+            }
+          }
