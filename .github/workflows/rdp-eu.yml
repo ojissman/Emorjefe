@@ -1,38 +1,109 @@
 
-name: Proton VPN Europe - Connection Test
+name: RDP Europe - Proton VPN
 
 on:
   workflow_dispatch:
 
 permissions:
   contents: read
+  id-token: write
 
 jobs:
-  vpn-test:
+  secure-rdp:
     runs-on: windows-latest
-    timeout-minutes: 15
+    timeout-minutes: 360
 
     steps:
 
-      # 1. Validate Proton configuration
-      - name: Validate Proton Configuration
+      # 1. Configure secure RDP
+      - name: Configure RDP Security
+        shell: pwsh
+        run: |
+          Set-ItemProperty `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+            -Name "fDenyTSConnections" -Value 0
+
+          Set-ItemProperty `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name "UserAuthentication" -Value 1
+
+          Set-ItemProperty `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name "SecurityLayer" -Value 2
+
+          Get-NetFirewallRule -DisplayGroup "Remote Desktop" |
+            Disable-NetFirewallRule
+
+          New-NetFirewallRule `
+            -DisplayName "RDP-Tailscale-Only" `
+            -Direction Inbound `
+            -Protocol TCP `
+            -LocalPort 3389 `
+            -RemoteAddress "100.64.0.0/10" `
+            -Action Allow `
+            -Profile Any
+
+          Restart-Service TermService -Force
+
+          Write-Host "RDP security configured."
+
+      # 2. Create RDP administrator
+      - name: Create RDP User
         shell: pwsh
         env:
-          PROTON_WG_CONFIG: ${{ secrets.PROTON_WG_CONFIG }}
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
         run: |
-          if ([string]::IsNullOrWhiteSpace($env:PROTON_WG_CONFIG)) {
-            throw "Proton configuration secret is missing."
+          if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD)) {
+            throw "RDP_PASSWORD secret is missing."
           }
 
-          if ($env:PROTON_WG_CONFIG -notmatch '\[Interface\]' -or
-              $env:PROTON_WG_CONFIG -notmatch '\[Peer\]' -or
-              $env:PROTON_WG_CONFIG -notmatch '(?im)^PrivateKey\s*=') {
-            throw "Invalid WireGuard configuration."
+          $securePass = ConvertTo-SecureString `
+            $env:RDP_PASSWORD -AsPlainText -Force
+
+          if (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue) {
+            Remove-LocalUser -Name "RDP"
           }
 
-          Write-Host "Proton configuration validated."
+          New-LocalUser `
+            -Name "RDP" `
+            -Password $securePass `
+            -AccountNeverExpires `
+            -PasswordNeverExpires
 
-      # 2. Install WireGuard
+          Add-LocalGroupMember `
+            -Group "Administrators" -Member "RDP"
+
+          Add-LocalGroupMember `
+            -Group "Remote Desktop Users" -Member "RDP"
+
+          Write-Host "RDP account created."
+
+      # 3. Connect Tailscale
+      - name: Connect Tailscale
+        uses: tailscale/github-action@v4
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          audience: ${{ secrets.TS_AUDIENCE }}
+          tags: tag:ci
+          version: latest
+          args: --accept-dns=false
+
+      # 4. Obtain Tailscale IP
+      - name: Get Tailscale IP
+        shell: pwsh
+        run: |
+          $tsIP = (tailscale ip -4 |
+            Select-Object -First 1).Trim()
+
+          if (-not $tsIP) {
+            throw "Tailscale IP was not assigned."
+          }
+
+          Add-Content $env:GITHUB_ENV "TAILSCALE_IP=$tsIP"
+
+          Write-Host "RDP Address: $tsIP"
+
+      # 5. Install WireGuard
       - name: Install WireGuard
         shell: pwsh
         run: |
@@ -53,101 +124,95 @@ jobs:
             -Wait -PassThru
 
           if ($process.ExitCode -notin @(0, 3010)) {
-            throw "WireGuard installation failed: $($process.ExitCode)"
+            throw "WireGuard installation failed."
           }
 
-          $wg = "$env:ProgramFiles\WireGuard\wireguard.exe"
-
-          if (-not (Test-Path $wg)) {
-            throw "WireGuard executable not found."
+          if (-not (Test-Path "$env:ProgramFiles\WireGuard\wireguard.exe")) {
+            throw "WireGuard executable missing."
           }
 
           Write-Host "WireGuard installed successfully."
 
-      # 3. Register and start Proton VPN tunnel
-      - name: Connect Proton VPN Netherlands
+      # 6. Connect Proton VPN
+      - name: Connect Proton VPN Europe
         shell: pwsh
         env:
           PROTON_WG_CONFIG: ${{ secrets.PROTON_WG_CONFIG }}
         run: |
-          $ErrorActionPreference = "Stop"
+          if ([string]::IsNullOrWhiteSpace($env:PROTON_WG_CONFIG)) {
+            throw "Proton configuration secret missing."
+          }
+
+          $config = $env:PROTON_WG_CONFIG.Trim()
+
+          if ($config -notmatch '\[Interface\]' -or
+              $config -notmatch '\[Peer\]') {
+            throw "Invalid Proton configuration."
+          }
+
+          # Preserve Tailscale's more-specific 100.64.0.0/10 route
+          # while routing ordinary internet traffic through Proton.
+          $config = $config.Replace(
+            '0.0.0.0/0',
+            '0.0.0.0/1, 128.0.0.0/1'
+          )
+
+          $config = $config.Replace(
+            '::/0',
+            '::/1, 8000::/1'
+          )
 
           $configPath = Join-Path $env:RUNNER_TEMP "proton-eu.conf"
 
-          $wg = "$env:ProgramFiles\WireGuard\wireguard.exe"
+          Set-Content -Path $configPath `
+            -Value $config -Encoding ascii
 
+          $wg = "$env:ProgramFiles\WireGuard\wireguard.exe"
           $wgExe = "$env:ProgramFiles\WireGuard\wg.exe"
 
-          Set-Content -Path $configPath `
-            -Value $env:PROTON_WG_CONFIG.Trim() `
-            -Encoding ascii
-
-          Write-Host "Starting WireGuard tunnel installation..."
-
-          $arguments = "/installtunnelservice `"$configPath`""
+          Write-Host "Installing Proton tunnel..."
 
           $process = Start-Process `
             -FilePath $wg `
-            -ArgumentList $arguments `
-            -Wait `
-            -PassThru `
+            -ArgumentList "/installtunnelservice `"$configPath`"" `
+            -Wait -PassThru `
             -NoNewWindow
 
-          $exitCode = $process.ExitCode
-
-          Write-Host "WireGuard process exit code: $exitCode"
-
-          if ($exitCode -ne 0) {
-            throw "WireGuard tunnel installation failed with exit code $exitCode."
+          if ($process.ExitCode -ne 0) {
+            throw "WireGuard installation failed: $($process.ExitCode)"
           }
-
-          Write-Host "Tunnel installation command succeeded."
 
           $serviceName = 'WireGuardTunnel$proton-eu'
 
           $deadline = (Get-Date).AddSeconds(90)
 
-          $running = $false
-
           do {
             Start-Sleep -Seconds 3
-
-            $service = Get-Service `
-              -Name $serviceName `
+            $service = Get-Service -Name $serviceName `
               -ErrorAction SilentlyContinue
+          } until (
+            ($service -and $service.Status -eq "Running") -or
+            (Get-Date) -gt $deadline
+          )
 
-            if ($service -and $service.Status -eq "Running") {
-              $running = $true
-              break
-            }
-
-          } until ((Get-Date) -gt $deadline)
-
-          if (-not $running) {
-            if ($service) {
-              Write-Host "Service status: $($service.Status)"
-            }
-
-            throw "WireGuard tunnel service did not start."
+          if (-not $service -or $service.Status -ne "Running") {
+            throw "Proton tunnel service did not start."
           }
 
-          Write-Host "Proton VPN tunnel service is running."
+          Write-Host "Proton tunnel service is running."
 
-          # Generate traffic to trigger a VPN handshake
-          $deadline = (Get-Date).AddSeconds(150)
-
+          # Trigger outgoing traffic and wait for handshake
           $connected = $false
+          $deadline = (Get-Date).AddSeconds(150)
 
           do {
             try {
-              $ip = Invoke-RestMethod `
+              Invoke-RestMethod `
                 -Uri "https://api.ipify.org" `
-                -TimeoutSec 10
-
-              Write-Host "Internet connectivity detected."
+                -TimeoutSec 15 | Out-Null
             }
             catch {
-              Write-Host "Waiting for VPN internet connectivity..."
+              Write-Host "Waiting for VPN connectivity..."
             }
 
             Start-Sleep -Seconds 3
@@ -171,13 +236,13 @@ jobs:
           } until ($connected -or (Get-Date) -gt $deadline)
 
           if (-not $connected) {
-            throw "Proton VPN handshake was not established."
+            throw "Proton VPN handshake failed."
           }
 
-          Write-Host "SUCCESS: Proton VPN handshake established."
+          Write-Host "Proton VPN connected successfully."
 
-      # 4. Verify Netherlands public IP
-      - name: Verify Netherlands Public IP
+      # 7. Verify public IP without falsely rejecting geolocation
+      - name: Verify VPN Public IP
         shell: pwsh
         run: |
           $ip = (Invoke-RestMethod `
@@ -186,40 +251,68 @@ jobs:
 
           Write-Host "Public IP: $ip"
 
-          $geo = Invoke-RestMethod `
-            -Uri "https://ipapi.co/$ip/json/" `
-            -TimeoutSec 30
+          try {
+            $geo = Invoke-RestMethod `
+              -Uri "https://ipapi.co/$ip/json/" `
+              -TimeoutSec 30
 
-          Write-Host "Country: $($geo.country_name)"
-          Write-Host "Country code: $($geo.country_code)"
-          Write-Host "City: $($geo.city)"
+            Write-Host "Country: $($geo.country_name)"
+            Write-Host "Country code: $($geo.country_code)"
+            Write-Host "City: $($geo.city)"
 
-          if ($geo.country_code -ne "NL") {
-            throw "Expected Netherlands IP. Received $($geo.country_code)."
+            if ($geo.country_code -eq "CH") {
+              Write-Warning "IP geolocation reports Switzerland, not UK/EU. Check server location separately."
+            }
+          }
+          catch {
+            Write-Warning "IP geolocation lookup unavailable."
           }
 
-          Write-Host "SUCCESS: Netherlands public IP verified."
-
-      # 5. Clean up VPN tunnel
-      - name: Disconnect Proton VPN
-        if: always()
+      # 8. Display RDP information
+      - name: Display RDP Access
         shell: pwsh
         run: |
-          $wg = "$env:ProgramFiles\WireGuard\wireguard.exe"
+          Write-Host ""
+          Write-Host "========== RDP ACCESS =========="
+          Write-Host "Address : $env:TAILSCALE_IP"
+          Write-Host "Username: RDP"
+          Write-Host "Password: Use RDP_PASSWORD secret"
+          Write-Host "VPN     : Proton WireGuard"
+          Write-Host "Duration: Up to 6 hours"
+          Write-Host "================================"
 
-          if (Test-Path $wg) {
-            $process = Start-Process `
-              -FilePath $wg `
-              -ArgumentList "/uninstalltunnelservice proton-eu" `
-              -Wait `
-              -PassThru `
-              -NoNewWindow
+      # 9. Maintain RDP session
+      - name: Maintain RDP Session
+        shell: pwsh
+        run: |
+          $serviceName = 'WireGuardTunnel$proton-eu'
 
-            Write-Host "Tunnel cleanup exit code: $($process.ExitCode)"
+          while ($true) {
+            Start-Sleep -Seconds 300
+
+            $service = Get-Service -Name $serviceName
+
+            if ($service.Status -ne "Running") {
+              Write-Warning "VPN service stopped. Attempting restart."
+
+              Start-Service -Name $serviceName
+              Start-Sleep -Seconds 10
+
+              $service = Get-Service -Name $serviceName
+
+              if ($service.Status -ne "Running") {
+                throw "VPN service could not be restarted."
+              }
+            }
+
+            try {
+              $ip = (Invoke-RestMethod `
+                -Uri "https://api.ipify.org" `
+                -TimeoutSec 20).Trim()
+
+              Write-Host "[$(Get-Date)] RDP active | Public IP: $ip"
+            }
+            catch {
+              Write-Warning "Public IP check failed."
+            }
           }
-
-          Remove-Item `
-            (Join-Path $env:RUNNER_TEMP "proton-eu.conf") `
-            -Force -ErrorAction SilentlyContinue
-
-          Write-Host "VPN cleanup completed."
