@@ -3,7 +3,7 @@
     {
       "id": "FIVEPERCENTONLINE",
       "name": "Five Percent Online",
-      "installer": "fivepercentonline5etup.exe",
+      "installer": "fivepercentonline5setup.exe",
       "server": "FivePercentOnline-Real",
       "terminal_prefix": "FIVEPERCENTONLINE_MT5",
       "accounts": [
