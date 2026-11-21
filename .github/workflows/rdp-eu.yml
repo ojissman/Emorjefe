@@ -1,0 +1,82 @@
+
+name: Proton VPN Europe - Connection Test
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  vpn-test:
+    runs-on: windows-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check required secret
+        shell: pwsh
+        env:
+          PROTON_WG_CONFIG: ${{ secrets.PROTON_WG_CONFIG }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:PROTON_WG_CONFIG)) {
+            throw "PROTON_WG_CONFIG secret is missing."
+          }
+
+          if ($env:PROTON_WG_CONFIG -notmatch '\[Interface\]' -or
+              $env:PROTON_WG_CONFIG -notmatch '\[Peer\]') {
+            throw "Invalid WireGuard configuration."
+          }
+
+          Write-Host "VPN configuration secret detected."
+
+      - name: Install WireGuard
+        shell: pwsh
+        run: |
+          $release = Invoke-RestMethod `
+            -Uri "https://api.github.com/repos/WireGuard/wireguard-windows/releases/latest" `
+            -Headers @{ "User-Agent" = "GitHub-Actions" }
+
+          $asset = $release.assets |
+            Where-Object {
+              $_.name -match '^wireguard-amd64-.*\.msi$'
+            } |
+            Select-Object -First 1
+
+          if (-not $asset) {
+            throw "WireGuard installer not found."
+          }
+
+          $msi = Join-Path $env:TEMP "wireguard.msi"
+
+          Invoke-WebRequest `
+            -Uri $asset.browser_download_url `
+            -OutFile $msi
+
+          $signature = Get-AuthenticodeSignature $msi
+
+          if ($signature.Status -ne "Valid") {
+            throw "WireGuard installer signature invalid."
+          }
+
+          $result = Start-Process msiexec.exe `
+            -ArgumentList "/i `"$msi`" /qn /norestart" `
+            -Wait -PassThru
+
+          if ($result.ExitCode -notin @(0, 3010)) {
+            throw "WireGuard installation failed."
+          }
+
+          Write-Host "WireGuard installed successfully."
+
+      - name: Verify installation
+        shell: pwsh
+        run: |
+          $wg = "$env:ProgramFiles\WireGuard\wireguard.exe"
+
+          if (-not (Test-Path $wg)) {
+            throw "WireGuard executable not found."
+          }
+
+          Write-Host "WireGuard executable verified."
+          Write-Host "VPN installation test passed."
