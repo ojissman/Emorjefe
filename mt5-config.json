@@ -1,0 +1,15 @@
+{
+  "brokers": [
+    {
+      "id": "FIVEPERCENTONLINE",
+      "name": "Five Percent Online",
+      "installer": "fivepercentonlineSetup.exe",
+      "server": "FivePercentOnline-Real",
+      "terminal_prefix": "FIVEPERCENTONLINE_MT5",
+      "accounts": [
+        "01", "02", "03", "04", "05",
+        "06", "07", "08", "09", "10"
+      ]
+    }
+  ]
+}
