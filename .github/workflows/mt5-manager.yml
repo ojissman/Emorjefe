@@ -13,15 +13,21 @@ jobs:
     timeout-minutes: 20
 
     steps:
+      # 1. Download repository files
       - name: Checkout Repository
         uses: actions/checkout@v4
 
+      # 2. Validate broker configuration and installer
       - name: Validate Broker Configuration
         shell: pwsh
         run: |
-          $config = Get-Content `
-            "$env:GITHUB_WORKSPACE/mt5-config.json" `
-            -Raw | ConvertFrom-Json
+          $configPath = Join-Path $env:GITHUB_WORKSPACE "mt5-config.json"
+
+          if (-not (Test-Path $configPath)) {
+            throw "mt5-config.json not found."
+          }
+
+          $config = Get-Content $configPath -Raw | ConvertFrom-Json
 
           $broker = $config.brokers |
             Where-Object { $_.id -eq "FIVEPERCENTONLINE" }
@@ -35,17 +41,18 @@ jobs:
           }
 
           $installer = Join-Path `
-            $env:GITHUB_WORKSPACE `
-            $broker.installer
+            $env:GITHUB_WORKSPACE $broker.installer
 
           if (-not (Test-Path $installer)) {
             throw "Broker installer not found: $($broker.installer)"
           }
 
           Write-Host "Broker configuration verified."
+          Write-Host "Broker: $($broker.name)"
           Write-Host "Server: $($broker.server)"
-          Write-Host "Installer found."
+          Write-Host "Installer: $($broker.installer)"
 
+      # 3. Validate MT5 account 01 credentials
       - name: Validate MT5 Account 01
         shell: pwsh
         env:
@@ -63,40 +70,63 @@ jobs:
           Write-Host "Account 01 credentials detected."
           Write-Host "Credentials will not be displayed."
 
+      # 4. Inspect Windows environment
       - name: Verify Windows Environment
         shell: pwsh
         run: |
           Write-Host "Windows environment ready."
 
-          Get-CimInstance Win32_OperatingSystem |
-            Select-Object Caption, Version
+          $os = Get-CimInstance Win32_OperatingSystem
 
-          Write-Host "Available memory:"
-          Get-CimInstance Win32_OperatingSystem |
-            Select-Object FreePhysicalMemory
+          Write-Host "Operating system: $($os.Caption)"
+          Write-Host "Version: $($os.Version)"
 
+          $memoryGB = [math]::Round(
+            $os.FreePhysicalMemory / 1MB, 2
+          )
+
+          Write-Host "Available memory: $memoryGB GB"
+
+      # 5. Verify installer using configuration filename
       - name: Verify Installer Signature
         shell: pwsh
         run: |
+          $configPath = Join-Path $env:GITHUB_WORKSPACE "mt5-config.json"
+
+          $config = Get-Content $configPath -Raw |
+            ConvertFrom-Json
+
+          $broker = $config.brokers |
+            Where-Object { $_.id -eq "FIVEPERCENTONLINE" }
+
           $installer = Join-Path `
-            $env:GITHUB_WORKSPACE `
-            "fivepercentonlineSetup.exe"
+            $env:GITHUB_WORKSPACE $broker.installer
+
+          if (-not (Test-Path $installer)) {
+            throw "Installer not found: $installer"
+          }
 
           $signature = Get-AuthenticodeSignature $installer
 
+          Write-Host "Installer: $($broker.installer)"
           Write-Host "Signature status: $($signature.Status)"
 
           if ($signature.Status -ne "Valid") {
-            Write-Warning "Installer signature is not verified. Installation is not being attempted."
+            Write-Warning "Installer signature is not verified. Manual verification is required before installation."
           } else {
             Write-Host "Installer signature verified."
           }
 
+          Write-Host "Installer successfully located."
+
+      # 6. Finish preparation
       - name: Preparation Complete
         shell: pwsh
         run: |
+          Write-Host ""
           Write-Host "================================"
           Write-Host "MT5 MANAGER PREPARATION COMPLETE"
+          Write-Host "================================"
           Write-Host "Broker: FIVEPERCENTONLINE"
           Write-Host "Server: FivePercentOnline-Real"
           Write-Host "Account: 01"
