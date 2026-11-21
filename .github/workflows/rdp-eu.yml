@@ -1,12 +1,10 @@
 
-name: Proton VPN Europe - Connection Test
-
+name: RDP Europe
 on:
   workflow_dispatch:
 
 permissions:
   contents: read
-  id-token: write
 
 jobs:
   vpn-test:
@@ -14,7 +12,8 @@ jobs:
     timeout-minutes: 15
 
     steps:
-      - name: Check Proton configuration
+      # 1. Check Proton configuration
+      - name: Check Proton Configuration
         shell: pwsh
         env:
           PROTON_WG_CONFIG: ${{ secrets.PROTON_WG_CONFIG }}
@@ -30,20 +29,15 @@ jobs:
 
           Write-Host "Proton configuration detected successfully."
 
-      - name: Download official WireGuard installer
+      # 2. Install WireGuard
+      - name: Install WireGuard
         shell: pwsh
         run: |
           $msi = Join-Path $env:TEMP "wireguard-amd64.msi"
 
           $url = "https://download.wireguard.com/windows-client/wireguard-amd64-1.1.1.msi"
 
-          Write-Host "Downloading WireGuard..."
-
           Invoke-WebRequest -Uri $url -OutFile $msi
-
-          if (-not (Test-Path $msi)) {
-            throw "WireGuard installer download failed."
-          }
 
           $signature = Get-AuthenticodeSignature $msi
 
@@ -51,40 +45,139 @@ jobs:
             throw "WireGuard installer signature is invalid."
           }
 
-          Write-Host "Installer signature verified."
-
           $result = Start-Process msiexec.exe `
             -ArgumentList "/i `"$msi`" /qn /norestart" `
             -Wait -PassThru
 
           if ($result.ExitCode -notin @(0, 3010)) {
-            throw "WireGuard installation failed. Exit code: $($result.ExitCode)"
+            throw "WireGuard installation failed."
           }
 
           $wg = "$env:ProgramFiles\WireGuard\wireguard.exe"
 
           if (-not (Test-Path $wg)) {
-            throw "WireGuard executable was not found."
+            throw "WireGuard executable not found."
           }
 
           Write-Host "WireGuard installed successfully."
 
-      - name: Verify WireGuard installation
+      # 3. Connect automatically to Proton VPN
+      - name: Connect Proton VPN Netherlands
+        shell: pwsh
+        env:
+          PROTON_WG_CONFIG: ${{ secrets.PROTON_WG_CONFIG }}
+        run: |
+          $configPath = Join-Path $env:RUNNER_TEMP "proton-eu.conf"
+
+          $config = $env:PROTON_WG_CONFIG.Trim()
+
+          Set-Content -Path $configPath `
+            -Value $config -Encoding ascii
+
+          $wg = "$env:ProgramFiles\WireGuard\wireguard.exe"
+
+          Write-Host "Installing Proton VPN tunnel service..."
+
+          & $wg /installtunnelservice $configPath
+
+          if ($LASTEXITCODE -ne 0) {
+            Remove-Item $configPath -Force -ErrorAction SilentlyContinue
+            throw "Could not install Proton VPN tunnel service."
+          }
+
+          $serviceName = 'WireGuardTunnel$proton-eu'
+
+          $service = Get-Service -Name $serviceName `
+            -ErrorAction Stop
+
+          if ($service.Status -ne "Running") {
+            Start-Service -Name $serviceName
+          }
+
+          Write-Host "Waiting for Proton VPN connection..."
+
+          $wgExe = "$env:ProgramFiles\WireGuard\wg.exe"
+
+          $deadline = (Get-Date).AddSeconds(120)
+          $connected = $false
+
+          do {
+            Start-Sleep -Seconds 3
+
+            try {
+              $ip = (Invoke-RestMethod `
+                -Uri "https://api.ipify.org" `
+                -TimeoutSec 10).Trim()
+            }
+            catch {
+              Write-Host "Waiting for internet through VPN..."
+            }
+
+            $handshakes = & $wgExe show proton-eu latest-handshakes
+
+            foreach ($line in $handshakes) {
+              $parts = $line -split '\s+'
+
+              if ($parts.Count -ge 2) {
+                $timestamp = 0L
+
+                if ([long]::TryParse($parts[-1], [ref]$timestamp)) {
+                  $age = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds() - $timestamp
+
+                  if ($timestamp -gt 0 -and $age -lt 120) {
+                    $connected = $true
+                  }
+                }
+              }
+            }
+
+          } until ($connected -or (Get-Date) -gt $deadline)
+
+          if (-not $connected) {
+            throw "Proton VPN handshake was not established."
+          }
+
+          Write-Host "Proton VPN handshake successful."
+
+      # 4. Verify public IP and country
+      - name: Verify Netherlands Public IP
+        shell: pwsh
+        run: |
+          Start-Sleep -Seconds 5
+
+          $ip = (Invoke-RestMethod `
+            -Uri "https://api.ipify.org" `
+            -TimeoutSec 20).Trim()
+
+          Write-Host "Public IP: $ip"
+
+          $geo = Invoke-RestMethod `
+            -Uri "https://ipapi.co/$ip/json/" `
+            -TimeoutSec 20
+
+          Write-Host "Country: $($geo.country_name)"
+          Write-Host "Country code: $($geo.country_code)"
+          Write-Host "City: $($geo.city)"
+
+          if ($geo.country_code -ne "NL") {
+            throw "Expected Netherlands IP, received $($geo.country_code)."
+          }
+
+          Write-Host "Netherlands VPN verification successful!"
+
+      # 5. Disconnect test tunnel and clean up
+      - name: Disconnect Proton VPN
+        if: always()
         shell: pwsh
         run: |
           $wg = "$env:ProgramFiles\WireGuard\wireguard.exe"
-          $wgExe = "$env:ProgramFiles\WireGuard\wg.exe"
 
-          if (-not (Test-Path $wg)) {
-            throw "WireGuard application not found."
+          if (Test-Path $wg) {
+            & $wg /uninstalltunnelservice proton-eu
           }
 
-          if (-not (Test-Path $wgExe)) {
-            throw "WireGuard command-line utility not found."
-          }
+          Remove-Item `
+            (Join-Path $env:RUNNER_TEMP "proton-eu.conf") `
+            -Force -ErrorAction SilentlyContinue
 
-          $version = (Get-Item $wg).VersionInfo.FileVersion
-
-          Write-Host "WireGuard version: $version"
-          Write-Host "WireGuard installation verified."
-          Write-Host "VPN installation test PASSED."
+          Write-Host "VPN test cleanup completed."
