@@ -1,134 +1,267 @@
 
-name: MT5 Manager - FivePercentOnline
+name: RDP Nigeria - Proton VPN - Tailscale - MT5
 
 on:
   workflow_dispatch:
 
 permissions:
   contents: read
+  id-token: write
 
 jobs:
-  prepare-mt5:
+  rdp-mt5:
     runs-on: windows-latest
-    timeout-minutes: 20
+    timeout-minutes: 360
 
     steps:
-      # 1. Download repository files
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      # 2. Validate broker configuration and installer
-      - name: Validate Broker Configuration
-        shell: pwsh
-        run: |
-          $configPath = Join-Path $env:GITHUB_WORKSPACE "mt5-config.json"
-
-          if (-not (Test-Path $configPath)) {
-            throw "mt5-config.json not found."
-          }
-
-          $config = Get-Content $configPath -Raw | ConvertFrom-Json
-
-          $broker = $config.brokers |
-            Where-Object { $_.id -eq "FIVEPERCENTONLINE" }
-
-          if (-not $broker) {
-            throw "FivePercentOnline broker configuration missing."
-          }
-
-          if ($broker.server -ne "FivePercentOnline-Real") {
-            throw "Unexpected broker server."
-          }
-
-          $installer = Join-Path `
-            $env:GITHUB_WORKSPACE $broker.installer
-
-          if (-not (Test-Path $installer)) {
-            throw "Broker installer not found: $($broker.installer)"
-          }
-
-          Write-Host "Broker configuration verified."
-          Write-Host "Broker: $($broker.name)"
-          Write-Host "Server: $($broker.server)"
-          Write-Host "Installer: $($broker.installer)"
-
-      # 3. Validate MT5 account 01 credentials
-      - name: Validate MT5 Account 01
+      # 1. Configure Windows RDP
+      - name: Configure RDP
         shell: pwsh
         env:
-          MT5_LOGIN: ${{ secrets.FIVEPERCENTONLINE_LOGIN_01 }}
-          MT5_PASSWORD: ${{ secrets.FIVEPERCENTONLINE_PASSWORD_01 }}
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
         run: |
-          if ([string]::IsNullOrWhiteSpace($env:MT5_LOGIN)) {
-            throw "Account 01 login secret missing."
+          $ErrorActionPreference = "Stop"
+
+          if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD)) {
+            throw "RDP_PASSWORD secret missing."
           }
 
-          if ([string]::IsNullOrWhiteSpace($env:MT5_PASSWORD)) {
-            throw "Account 01 password secret missing."
+          Set-ItemProperty `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+            -Name fDenyTSConnections -Value 0
+
+          Set-ItemProperty `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name UserAuthentication -Value 1
+
+          Set-ItemProperty `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name SecurityLayer -Value 2
+
+          Get-NetFirewallRule -DisplayGroup "Remote Desktop" |
+            Disable-NetFirewallRule
+
+          New-NetFirewallRule `
+            -DisplayName "RDP-Tailscale-Only" `
+            -Direction Inbound `
+            -Protocol TCP `
+            -LocalPort 3389 `
+            -RemoteAddress "100.64.0.0/10" `
+            -Action Allow `
+            -Profile Any
+
+          $securePass = ConvertTo-SecureString `
+            $env:RDP_PASSWORD -AsPlainText -Force
+
+          if (-not (Get-LocalUser -Name RDP -ErrorAction SilentlyContinue)) {
+            New-LocalUser -Name RDP `
+              -Password $securePass `
+              -PasswordNeverExpires
+          } else {
+            Set-LocalUser -Name RDP -Password $securePass
           }
 
-          Write-Host "Account 01 credentials detected."
-          Write-Host "Credentials will not be displayed."
+          Add-LocalGroupMember -Group Administrators `
+            -Member RDP -ErrorAction SilentlyContinue
 
-      # 4. Inspect Windows environment
-      - name: Verify Windows Environment
+          Add-LocalGroupMember -Group "Remote Desktop Users" `
+            -Member RDP -ErrorAction SilentlyContinue
+
+          Restart-Service TermService -Force
+
+      # 2. Install WireGuard
+      - name: Install WireGuard
         shell: pwsh
         run: |
-          Write-Host "Windows environment ready."
+          $ErrorActionPreference = "Stop"
 
-          $os = Get-CimInstance Win32_OperatingSystem
+          $msi = Join-Path $env:TEMP "wireguard-amd64.msi"
 
-          Write-Host "Operating system: $($os.Caption)"
-          Write-Host "Version: $($os.Version)"
+          Invoke-WebRequest `
+            "https://download.wireguard.com/windows-client/wireguard-amd64-1.0.20250521.msi" `
+            -OutFile $msi
 
-          $memoryGB = [math]::Round(
-            $os.FreePhysicalMemory / 1MB, 2
-          )
+          Start-Process msiexec.exe `
+            -ArgumentList "/i `"$msi`" /quiet /norestart" `
+            -Wait
 
-          Write-Host "Available memory: $memoryGB GB"
+          $wg = "$env:ProgramFiles\WireGuard\wireguard.exe"
 
-      # 5. Verify installer using configuration filename
-      - name: Verify Installer Signature
+          if (-not (Test-Path $wg)) {
+            throw "WireGuard installation failed."
+          }
+
+      # 3. Connect Proton VPN
+      - name: Connect Proton VPN
+        shell: pwsh
+        env:
+          PROTON_WG_CONFIG: ${{ secrets.PROTON_WG_CONFIG }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          if ([string]::IsNullOrWhiteSpace($env:PROTON_WG_CONFIG)) {
+            throw "PROTON_WG_CONFIG secret missing."
+          }
+
+          $wg = "$env:ProgramFiles\WireGuard\wireguard.exe"
+          $configPath = Join-Path $env:RUNNER_TEMP "proton-eu.conf"
+
+          $env:PROTON_WG_CONFIG |
+            Set-Content $configPath -Encoding ascii
+
+          $result = Start-Process $wg `
+            -ArgumentList "/installtunnelservice `"$configPath`"" `
+            -Wait -PassThru
+
+          if ($result.ExitCode -ne 0) {
+            throw "WireGuard tunnel installation failed."
+          }
+
+          Start-Sleep -Seconds 10
+
+          $ip = (Invoke-RestMethod "https://api.ipify.org").Trim()
+          $geo = Invoke-RestMethod "https://ipapi.co/$ip/json/"
+
+          Write-Host "VPN IP: $ip"
+          Write-Host "VPN country: $($geo.country_name)"
+
+          if ($geo.country_code -notin @("NL","PL","RO")) {
+            throw "VPN exit country is not an approved EU location."
+          }
+
+      # 4. Connect Tailscale
+      - name: Connect Tailscale
+        uses: tailscale/github-action@v4
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          audience: ${{ secrets.TS_AUDIENCE }}
+          tags: tag:ci
+          version: latest
+
+      # 5. Verify Tailscale
+      - name: Get Tailscale IP
         shell: pwsh
         run: |
-          $configPath = Join-Path $env:GITHUB_WORKSPACE "mt5-config.json"
+          $ip = (tailscale ip -4 | Select-Object -First 1).Trim()
 
-          $config = Get-Content $configPath -Raw |
+          if (-not $ip) {
+            throw "Tailscale IP unavailable."
+          }
+
+          Add-Content $env:GITHUB_ENV "TAILSCALE_IP=$ip"
+          Write-Host "RDP address: $ip"
+
+      # 6. Validate broker configuration
+      - name: Load MT5 Configuration
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $config = Get-Content `
+            "$env:GITHUB_WORKSPACE\mt5-config.json" -Raw |
             ConvertFrom-Json
 
-          $broker = $config.brokers |
-            Where-Object { $_.id -eq "FIVEPERCENTONLINE" }
+          foreach ($broker in $config.brokers) {
+            Write-Host "Broker: $($broker.id)"
+            Write-Host "Server: $($broker.server)"
+            Write-Host "Installer: $($broker.installer)"
 
-          $installer = Join-Path `
-            $env:GITHUB_WORKSPACE $broker.installer
+            $installer = Join-Path `
+              $env:GITHUB_WORKSPACE $broker.installer
 
-          if (-not (Test-Path $installer)) {
-            throw "Installer not found: $installer"
+            if (-not (Test-Path $installer)) {
+              throw "Installer missing: $($broker.installer)"
+            }
           }
 
-          $signature = Get-AuthenticodeSignature $installer
-
-          Write-Host "Installer: $($broker.installer)"
-          Write-Host "Signature status: $($signature.Status)"
-
-          if ($signature.Status -ne "Valid") {
-            Write-Warning "Installer signature is not verified. Manual verification is required before installation."
-          } else {
-            Write-Host "Installer signature verified."
-          }
-
-          Write-Host "Installer successfully located."
-
-      # 6. Finish preparation
-      - name: Preparation Complete
+      # 7. Install broker terminals
+      - name: Install MT5 Broker
         shell: pwsh
         run: |
-          Write-Host ""
+          $ErrorActionPreference = "Stop"
+
+          $config = Get-Content `
+            "$env:GITHUB_WORKSPACE\mt5-config.json" -Raw |
+            ConvertFrom-Json
+
+          foreach ($broker in $config.brokers) {
+            $installer = Join-Path `
+              $env:GITHUB_WORKSPACE $broker.installer
+
+            $brokerRoot = "C:\MT5\$($broker.id)"
+
+            New-Item -ItemType Directory `
+              -Path $brokerRoot -Force | Out-Null
+
+            Write-Host "Broker installation package located."
+            Write-Host "Target directory: $brokerRoot"
+
+            Write-Warning "Silent installation is installer-specific. No unsupported installer switches will be assumed."
+          }
+
+      # 8. Verify account secrets
+      - name: Detect Configured MT5 Accounts
+        shell: pwsh
+        env:
+          LOGIN_01: ${{ secrets.FIVEPERCENTONLINE_LOGIN_01 }}
+          PASSWORD_01: ${{ secrets.FIVEPERCENTONLINE_PASSWORD_01 }}
+          LOGIN_02: ${{ secrets.FIVEPERCENTONLINE_LOGIN_02 }}
+          PASSWORD_02: ${{ secrets.FIVEPERCENTONLINE_PASSWORD_02 }}
+          LOGIN_03: ${{ secrets.FIVEPERCENTONLINE_LOGIN_03 }}
+          PASSWORD_03: ${{ secrets.FIVEPERCENTONLINE_PASSWORD_03 }}
+          LOGIN_04: ${{ secrets.FIVEPERCENTONLINE_LOGIN_04 }}
+          PASSWORD_04: ${{ secrets.FIVEPERCENTONLINE_PASSWORD_04 }}
+          LOGIN_05: ${{ secrets.FIVEPERCENTONLINE_LOGIN_05 }}
+          PASSWORD_05: ${{ secrets.FIVEPERCENTONLINE_PASSWORD_05 }}
+          LOGIN_06: ${{ secrets.FIVEPERCENTONLINE_LOGIN_06 }}
+          PASSWORD_06: ${{ secrets.FIVEPERCENTONLINE_PASSWORD_06 }}
+          LOGIN_07: ${{ secrets.FIVEPERCENTONLINE_LOGIN_07 }}
+          PASSWORD_07: ${{ secrets.FIVEPERCENTONLINE_PASSWORD_07 }}
+          LOGIN_08: ${{ secrets.FIVEPERCENTONLINE_LOGIN_08 }}
+          PASSWORD_08: ${{ secrets.FIVEPERCENTONLINE_PASSWORD_08 }}
+          LOGIN_09: ${{ secrets.FIVEPERCENTONLINE_LOGIN_09 }}
+          PASSWORD_09: ${{ secrets.FIVEPERCENTONLINE_PASSWORD_09 }}
+          LOGIN_10: ${{ secrets.FIVEPERCENTONLINE_LOGIN_10 }}
+          PASSWORD_10: ${{ secrets.FIVEPERCENTONLINE_PASSWORD_10 }}
+        run: |
+          $accounts = @()
+
+          foreach ($n in 1..10) {
+            $id = $n.ToString("00")
+            $login = [Environment]::GetEnvironmentVariable("LOGIN_$id")
+            $password = [Environment]::GetEnvironmentVariable("PASSWORD_$id")
+
+            if ($login -and $password) {
+              $accounts += $id
+              Write-Host "Account $id credentials available."
+            }
+          }
+
+          if ($accounts.Count -eq 0) {
+            throw "No complete MT5 account credentials found."
+          }
+
+          Write-Host "Configured account count: $($accounts.Count)"
+
+      # 9. Display connection information
+      - name: Display RDP Information
+        shell: pwsh
+        run: |
           Write-Host "================================"
-          Write-Host "MT5 MANAGER PREPARATION COMPLETE"
+          Write-Host "RDP CONNECTION"
+          Write-Host "Address: $env:TAILSCALE_IP"
+          Write-Host "Username: RDP"
+          Write-Host "Password: GitHub RDP_PASSWORD secret"
           Write-Host "================================"
-          Write-Host "Broker: FIVEPERCENTONLINE"
-          Write-Host "Server: FivePercentOnline-Real"
-          Write-Host "Account: 01"
-          Write-Host "Terminal: FIVEPERCENTONLINE_MT5_01"
-          Write-Host "================================"
+
+      # 10. Keep runner alive
+      - name: Maintain Six Hour Session
+        shell: pwsh
+        run: |
+          while ($true) {
+            Write-Host "[$(Get-Date)] Runner session active."
+            Start-Sleep -Seconds 300
+          }
